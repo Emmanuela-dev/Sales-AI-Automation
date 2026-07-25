@@ -1,0 +1,59 @@
+version: '3.9'
+
+services:
+  # ─── PostgreSQL ───────────────────────────────────────────────────────────
+  # Only needed for fully local dev without Supabase Cloud.
+  # Supabase Cloud users can skip this service.
+  postgres:
+    image: postgres:16-alpine
+    container_name: prospectai_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-prospectai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-prospectai_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-prospectai}
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./apps/backend/src/db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U prospectai']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Redis ────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: prospectai_redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── BullMQ Dashboard (Bull Board) ────────────────────────────────────────
+  # Optional: comment out if not needed
+  bull-board:
+    image: deadly0/bull-board:latest
+    container_name: prospectai_bullboard
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    ports:
+      - '3001:3000'
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
