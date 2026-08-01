@@ -16,6 +16,84 @@
 - **Follows up** automatically when leads go cold
 
 
+## 🏁 Quick Start
+
+**Prerequisites:** Node.js 20+, Docker Desktop, a Supabase project, an OpenAI API key.
+
+### 1. Install
+
+```bash
+npm run setup      # installs dependencies + the Playwright chromium browser
+```
+
+### 2. Configure
+
+Copy the examples and fill in real values:
+
+```bash
+cp apps/backend/.env.example  apps/backend/.env
+cp apps/frontend/.env.example apps/frontend/.env.local
+```
+
+| Variable | Where to get it | Required? |
+| --- | --- | --- |
+| `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Supabase → Project Settings → API | Yes |
+| `DATABASE_URL` | Supabase → Project Settings → Database → Connection string (URI) | Yes, for migrations |
+| `JWT_SECRET` | Any random 32+ character string (`openssl rand -hex 32`) | Yes |
+| `OPENAI_API_KEY` | platform.openai.com/api-keys | Yes, for all AI features |
+| `GOOGLE_PLACES_API_KEY` | Google Cloud Console → Places API | Optional — without it, search only queries your existing database |
+
+The frontend needs `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` (same project) and `NEXT_PUBLIC_API_URL`.
+
+### 3. Start infrastructure and create the schema
+
+```bash
+docker-compose up -d redis
+npm run migrate
+```
+
+### 4. Verify the setup
+
+```bash
+npm run doctor
+```
+
+Checks Supabase, Redis, Playwright, OpenAI and Google Places, and tells you exactly what to fix for anything that fails. Get this green before continuing.
+
+### 5. Create your login user
+
+There is no sign-up page — only sign-in. Create your account in the Supabase
+dashboard under **Authentication → Users → Add user** (tick *Auto Confirm User*).
+
+### 6. Run
+
+```bash
+npm run dev
+```
+
+- Frontend — http://localhost:3000
+- Backend — http://localhost:4000
+- API docs — http://localhost:4000/docs
+
+In development the background workers run inside the API process. In production
+run them separately:
+
+```bash
+npm run build
+npm start --workspace=apps/backend          # API
+npm run start:workers --workspace=apps/backend   # queues + scheduler
+```
+
+### Authentication
+
+Every `/api/v1` route requires the Supabase access token as
+`Authorization: Bearer <token>`. The frontend attaches it automatically. To call
+the API by hand (curl, Swagger UI) during local development, set
+`DEV_ALLOW_ANONYMOUS=true` in `apps/backend/.env` — it is ignored when
+`NODE_ENV=production`.
+
+---
+
 ## 📊 Architecture Overview
 
 ```

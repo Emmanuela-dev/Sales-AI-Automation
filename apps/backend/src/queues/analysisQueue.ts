@@ -1,5 +1,5 @@
 import { Queue, Worker, Job } from 'bullmq';
-import { redis } from '../lib/redis';
+import { redisConnection, logRedisError } from '../lib/redis';
 import { analyzeWebsite } from '../services/analysis/websiteAnalyzer';
 import { supabaseAdmin } from '../lib/supabase';
 
@@ -13,7 +13,7 @@ interface AnalysisJobData {
 
 // Queue instance
 export const analysisQueue = new Queue<AnalysisJobData>(ANALYSIS_QUEUE, {
-  connection: redis,
+  connection: redisConnection,
   defaultJobOptions: {
     attempts: 3,
     backoff: { type: 'exponential', delay: 5000 },
@@ -37,17 +37,23 @@ export const analysisWorker = new Worker<AnalysisJobData>(
 
     const result = await analyzeWebsite(url);
 
-    await supabaseAdmin.from('website_analyses').upsert({
-      id: crypto.randomUUID(),
-      business_id,
-      ...result,
-    });
+    // Insert (not upsert): each run is a new point-in-time snapshot, and readers
+    // take the most recent row by analyzed_at. The previous upsert carried a
+    // freshly generated UUID so it could never conflict anyway — and its error
+    // was discarded, meaning a failed save was reported as a successful job.
+    const { error } = await supabaseAdmin
+      .from('website_analyses')
+      .insert({ business_id, ...result });
+
+    if (error) {
+      throw new Error(`Failed to save website analysis: ${error.message}`);
+    }
 
     job.log(`Analysis complete. Score: ${result.score}/100`);
     return result;
   },
   {
-    connection: redis,
+    connection: redisConnection,
     concurrency: 3, // Max 3 Playwright instances at once
   }
 );
@@ -59,3 +65,8 @@ analysisWorker.on('completed', (job) => {
 analysisWorker.on('failed', (job, err) => {
   console.error(`[AnalysisWorker] Job ${job?.id} failed:`, err.message);
 });
+
+// Without these listeners BullMQ rethrows connection errors, which surfaced as
+// raw AggregateError dumps on every reconnect attempt.
+analysisQueue.on('error', (err) => logRedisError('analysis-queue', err));
+analysisWorker.on('error', (err) => logRedisError('analysis-worker', err));

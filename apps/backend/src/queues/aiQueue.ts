@@ -1,5 +1,5 @@
 import { Queue, Worker } from 'bullmq';
-import { redis } from '../lib/redis';
+import { redisConnection, logRedisError } from '../lib/redis';
 import { scoreLead } from '../services/ai/leadScorer';
 import { runCompanyResearch } from '../services/ai/researchAgent';
 import { supabaseAdmin } from '../lib/supabase';
@@ -21,7 +21,7 @@ type AiJobData = LeadScoringJobData | ResearchJobData;
 
 // Queue instance
 export const aiQueue = new Queue<AiJobData>(AI_QUEUE, {
-  connection: redis,
+  connection: redisConnection,
   defaultJobOptions: {
     attempts: 3,
     backoff: { type: 'exponential', delay: 3000 },
@@ -57,12 +57,13 @@ export const aiWorker = new Worker<AiJobData>(
 
     if (data.type === 'company_research') {
       job.log(`Researching business ${data.business_id}`);
-      const { data: biz } = await supabaseAdmin
+      const { data: biz, error: bizError } = await supabaseAdmin
         .from('businesses')
         .select('*')
         .eq('id', data.business_id)
-        .single();
+        .maybeSingle();
 
+      if (bizError) throw new Error(`Failed to load business: ${bizError.message}`);
       if (!biz) throw new Error(`Business ${data.business_id} not found`);
 
       const { data: analysis } = await supabaseAdmin
@@ -81,7 +82,7 @@ export const aiWorker = new Worker<AiJobData>(
     throw new Error(`Unknown job type: ${(data as { type: string }).type}`);
   },
   {
-    connection: redis,
+    connection: redisConnection,
     concurrency: 5,
   }
 );
@@ -93,3 +94,8 @@ aiWorker.on('completed', (job) => {
 aiWorker.on('failed', (job, err) => {
   console.error(`[AIWorker] Job ${job?.id} (${job?.name}) failed:`, err.message);
 });
+
+// Without these listeners BullMQ rethrows connection errors, which surfaced as
+// raw AggregateError dumps on every reconnect attempt.
+aiQueue.on('error', (err) => logRedisError('ai-queue', err));
+aiWorker.on('error', (err) => logRedisError('ai-worker', err));

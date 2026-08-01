@@ -1,47 +1,109 @@
-import { chromium } from 'playwright';
+import { chromium, type Browser } from 'playwright';
 import * as cheerio from 'cheerio';
 import type { WebsiteAnalysis, WebsiteIssue } from '@prospectai/shared';
+import { assertPublicHttpUrl } from '../../lib/safeUrl';
+
+const NAVIGATION_TIMEOUT_MS = 20_000;
+const SLOW_LOAD_THRESHOLD_MS = 4000;
 
 /**
  * Analyzes a website URL using Playwright + Cheerio.
  * Returns a structured analysis report with issues and a score.
  */
 export async function analyzeWebsite(url: string): Promise<Omit<WebsiteAnalysis, 'id' | 'business_id'>> {
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (compatible; ProspectAIBot/1.0)',
-    viewport: { width: 1280, height: 800 },
-  });
+  const safeUrl = await assertPublicHttpUrl(url);
 
-  const page = await context.newPage();
+  let browser: Browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+  } catch (err) {
+    // Distinct from an unreachable site: this is a deployment problem, so fail
+    // loudly rather than reporting a bogus analysis.
+    throw new Error(
+      'Could not launch the Playwright browser. Run `npx playwright install chromium` ' +
+        `in the project root. Original error: ${(err as Error).message}`
+    );
+  }
 
   let html = '';
-  let techStack: string[] = [];
   let pageLoadTime = 0;
-  let hasHttps = false;
+  let loadFailure: string | null = null;
 
   try {
-    hasHttps = url.startsWith('https://');
-    const normalizedUrl = url.startsWith('http') ? url : `https://${url}`;
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (compatible; ProspectAIBot/1.0)',
+      viewport: { width: 1280, height: 800 },
+    });
+    const page = await context.newPage();
 
     const start = Date.now();
-    await page.goto(normalizedUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    const response = await page.goto(safeUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: NAVIGATION_TIMEOUT_MS,
+    });
     pageLoadTime = Date.now() - start;
 
-    html = await page.content();
-    techStack = await detectTechStack(page);
+    if (response && response.status() >= 400) {
+      loadFailure = `The site returned HTTP ${response.status()}.`;
+    } else {
+      html = await page.content();
+    }
   } catch (err) {
-    console.error(`Failed to load ${url}:`, err);
+    loadFailure = (err as Error).message.split('\n')[0];
   } finally {
     await browser.close();
   }
 
+  // A site we could not load must not be scored as if we had inspected it.
+  // Previously an unreachable site produced a full report of fabricated issues
+  // ("no HTTPS", "no contact form") derived from an empty document.
+  if (loadFailure !== null) {
+    return unreachableReport(safeUrl, loadFailure);
+  }
+
+  return buildReport(safeUrl, html, pageLoadTime);
+}
+
+function unreachableReport(
+  url: string,
+  reason: string
+): Omit<WebsiteAnalysis, 'id' | 'business_id'> {
+  return {
+    url,
+    score: 0,
+    has_https: url.startsWith('https://'),
+    is_mobile_responsive: false,
+    page_speed_score: 0,
+    has_booking_form: false,
+    has_contact_form: false,
+    has_seo_meta: false,
+    has_large_images: false,
+    has_analytics: false,
+    has_live_chat: false,
+    tech_stack: [],
+    issues: [
+      {
+        type: 'site_unreachable',
+        severity: 'critical',
+        description: `The website could not be loaded. ${reason}`,
+      },
+    ],
+    recommendations: [
+      'The site is unreachable — a strong opening for a rebuild or hosting conversation. Confirm the correct URL before reaching out.',
+    ],
+    analyzed_at: new Date().toISOString(),
+  };
+}
+
+function buildReport(
+  url: string,
+  html: string,
+  pageLoadTime: number
+): Omit<WebsiteAnalysis, 'id' | 'business_id'> {
   const $ = cheerio.load(html);
   const issues: WebsiteIssue[] = [];
 
-  // --- Checks ---
-
-  // HTTPS
+  const hasHttps = url.startsWith('https://');
   if (!hasHttps) {
     issues.push({ type: 'no_https', severity: 'critical', description: 'Site is not served over HTTPS.' });
   }
@@ -53,7 +115,7 @@ export async function analyzeWebsite(url: string): Promise<Omit<WebsiteAnalysis,
   }
 
   // Page speed
-  const isSlowLoad = pageLoadTime > 4000;
+  const isSlowLoad = pageLoadTime > SLOW_LOAD_THRESHOLD_MS;
   if (isSlowLoad) {
     issues.push({ type: 'slow_load', severity: 'warning', description: `Page took ${(pageLoadTime / 1000).toFixed(1)}s to load (should be under 3s).` });
   }
@@ -61,21 +123,21 @@ export async function analyzeWebsite(url: string): Promise<Omit<WebsiteAnalysis,
   // Booking/reservation forms
   const bookingKeywords = ['book', 'booking', 'reserve', 'reservation', 'appointment'];
   const pageText = $('body').text().toLowerCase();
-  const hasBookingForm = bookingKeywords.some(k => pageText.includes(k)) && $('form').length > 0;
+  const hasBookingForm = bookingKeywords.some((k) => pageText.includes(k)) && $('form').length > 0;
   if (!hasBookingForm) {
     issues.push({ type: 'no_booking_form', severity: 'warning', description: 'No booking or reservation form detected.' });
   }
 
   // Contact form
-  const hasContactForm = $('form').length > 0 && (
-    pageText.includes('contact') || pageText.includes('get in touch') || pageText.includes('send message')
-  );
+  const hasContactForm =
+    $('form').length > 0 &&
+    (pageText.includes('contact') || pageText.includes('get in touch') || pageText.includes('send message'));
   if (!hasContactForm) {
     issues.push({ type: 'no_contact_form', severity: 'warning', description: 'No contact form detected.' });
   }
 
   // SEO meta tags
-  const hasTitle = $('title').length > 0 && $('title').text().trim().length > 0;
+  const hasTitle = $('title').text().trim().length > 0;
   const hasMetaDesc = $('meta[name="description"]').length > 0;
   const hasSeoMeta = hasTitle && hasMetaDesc;
   if (!hasSeoMeta) {
@@ -84,7 +146,7 @@ export async function analyzeWebsite(url: string): Promise<Omit<WebsiteAnalysis,
 
   // Large unoptimized images
   const images = $('img').toArray();
-  const hasLargeImages = images.some(img => {
+  const hasLargeImages = images.some((img) => {
     const src = $(img).attr('src') ?? '';
     return !src.includes('.webp') && !src.includes('tiny') && !$(img).attr('loading');
   });
@@ -93,28 +155,25 @@ export async function analyzeWebsite(url: string): Promise<Omit<WebsiteAnalysis,
   }
 
   // Analytics
-  const hasAnalytics = html.includes('gtag') || html.includes('google-analytics') || html.includes('ga(') || html.includes('fbq(');
+  const hasAnalytics =
+    html.includes('gtag') || html.includes('google-analytics') || html.includes('ga(') || html.includes('fbq(');
   if (!hasAnalytics) {
     issues.push({ type: 'no_analytics', severity: 'info', description: 'No analytics tracking detected.' });
   }
 
   // Live chat
-  const hasLiveChat = html.includes('intercom') || html.includes('tawk.to') || html.includes('crisp') || html.includes('zendesk');
+  const hasLiveChat =
+    html.includes('intercom') || html.includes('tawk.to') || html.includes('crisp') || html.includes('zendesk');
 
-  // --- Score calculation ---
   const score = calculateScore({
     hasHttps,
     isMobileResponsive: hasViewportMeta,
     isSlowLoad,
-    hasBookingForm,
     hasContactForm,
     hasSeoMeta,
     hasLargeImages,
     hasAnalytics,
-    issueCount: issues.length,
   });
-
-  const recommendations = generateRecommendations(issues);
 
   return {
     url,
@@ -128,9 +187,9 @@ export async function analyzeWebsite(url: string): Promise<Omit<WebsiteAnalysis,
     has_large_images: hasLargeImages,
     has_analytics: hasAnalytics,
     has_live_chat: hasLiveChat,
-    tech_stack: techStack,
+    tech_stack: detectTechStack(html),
     issues,
-    recommendations,
+    recommendations: generateRecommendations(issues),
     analyzed_at: new Date().toISOString(),
   };
 }
@@ -139,12 +198,10 @@ function calculateScore(checks: {
   hasHttps: boolean;
   isMobileResponsive: boolean;
   isSlowLoad: boolean;
-  hasBookingForm: boolean;
   hasContactForm: boolean;
   hasSeoMeta: boolean;
   hasLargeImages: boolean;
   hasAnalytics: boolean;
-  issueCount: number;
 }): number {
   let score = 100;
   if (!checks.hasHttps) score -= 25;
@@ -159,7 +216,7 @@ function calculateScore(checks: {
 
 function generateRecommendations(issues: WebsiteIssue[]): string[] {
   const recs: Record<string, string> = {
-    no_https: 'Migrate site to HTTPS with an SSL certificate (free via Let\'s Encrypt).',
+    no_https: "Migrate site to HTTPS with an SSL certificate (free via Let's Encrypt).",
     not_mobile_responsive: 'Rebuild or redesign the site with a mobile-first responsive layout.',
     slow_load: 'Optimize images, enable caching, and use a CDN to improve load times.',
     no_booking_form: 'Add an online booking or appointment form to reduce friction for customers.',
@@ -168,12 +225,12 @@ function generateRecommendations(issues: WebsiteIssue[]): string[] {
     large_images: 'Convert images to WebP format and implement lazy loading.',
     no_analytics: 'Install Google Analytics or similar to track visitor behavior.',
   };
-  return issues.map(i => recs[i.type]).filter(Boolean);
+  return issues.map((i) => recs[i.type]).filter(Boolean);
 }
 
-async function detectTechStack(page: import('playwright').Page): Promise<string[]> {
+/** Operates on the already-fetched HTML rather than re-serializing the page. */
+function detectTechStack(html: string): string[] {
   const stack: string[] = [];
-  const html = await page.content();
 
   if (html.includes('wp-content') || html.includes('wp-includes')) stack.push('WordPress');
   if (html.includes('shopify')) stack.push('Shopify');

@@ -1,10 +1,23 @@
-import { openai, DEFAULT_MODEL } from '../../lib/openai';
+import { generateJson } from '../../lib/openai';
 import { supabaseAdmin } from '../../lib/supabase';
 import type { Business, CompanyResearch, WebsiteAnalysis } from '@prospectai/shared';
 
+interface ResearchResponse {
+  summary?: string;
+  industry?: string;
+  employee_range?: string;
+  estimated_revenue?: string;
+  likely_needs?: unknown;
+  estimated_budget_min?: unknown;
+  estimated_budget_max?: unknown;
+  currency?: string;
+  pain_points?: unknown;
+  recent_signals?: unknown;
+}
+
 /**
  * AI Company Research Agent
- * Generates a detailed company profile, identifies likely needs, 
+ * Generates a detailed company profile, identifies likely needs,
  * estimated budget, and sales signals.
  */
 export async function runCompanyResearch(
@@ -20,7 +33,7 @@ Website Analysis:
 - Has Booking Form: ${websiteAnalysis.has_booking_form ? 'Yes' : 'No'}
 - Has Contact Form: ${websiteAnalysis.has_contact_form ? 'Yes' : 'No'}
 - SEO Meta Tags: ${websiteAnalysis.has_seo_meta ? 'Yes' : 'No'}
-- Issues: ${websiteAnalysis.issues.map(i => i.description).join('; ')}
+- Issues: ${(websiteAnalysis.issues ?? []).map((i) => i.description).join('; ')}
 - Tech Stack: ${websiteAnalysis.tech_stack?.join(', ') || 'Unknown'}
 `
     : 'No website analysis available.';
@@ -51,36 +64,54 @@ Respond ONLY with a valid JSON object using this exact structure:
   "recent_signals": ["signal1", "signal2"]
 }`;
 
-  const response = await openai.chat.completions.create({
-    model: DEFAULT_MODEL,
-    messages: [{ role: 'user', content: prompt }],
+  const raw = await generateJson<ResearchResponse>({
+    prompt,
     temperature: 0.3,
-    response_format: { type: 'json_object' },
+    purpose: 'Company research',
   });
 
-  const raw = JSON.parse(response.choices[0].message.content ?? '{}');
-
-  const research: CompanyResearch = {
-    id: crypto.randomUUID(),
+  const record = {
     business_id: business.id,
-    summary: raw.summary ?? '',
+    summary: typeof raw.summary === 'string' ? raw.summary : '',
     industry: raw.industry ?? business.industry,
     employee_range: raw.employee_range ?? 'Unknown',
     estimated_revenue: raw.estimated_revenue,
-    likely_needs: raw.likely_needs ?? [],
-    estimated_budget_min: raw.estimated_budget_min,
-    estimated_budget_max: raw.estimated_budget_max,
+    likely_needs: toStringArray(raw.likely_needs),
+    estimated_budget_min: toInteger(raw.estimated_budget_min),
+    estimated_budget_max: toInteger(raw.estimated_budget_max),
     currency: raw.currency ?? 'KES',
-    pain_points: raw.pain_points ?? [],
-    recent_signals: raw.recent_signals ?? [],
-    generated_at: new Date().toISOString(),
+    pain_points: toStringArray(raw.pain_points),
+    recent_signals: toStringArray(raw.recent_signals),
   };
 
-  // Save to database
-  await supabaseAdmin.from('company_research').upsert({
-    ...research,
-    updated_at: new Date().toISOString(),
-  });
+  // Insert, letting Postgres assign the id and timestamps. This was previously
+  // an upsert carrying a freshly generated UUID, which could never conflict, and
+  // whose error was never checked — a failed save looked like a success.
+  const { data, error } = await supabaseAdmin
+    .from('company_research')
+    .insert(record)
+    .select()
+    .single();
 
-  return research;
+  if (error) {
+    throw new Error(`Failed to save company research: ${error.message}`);
+  }
+
+  return data as CompanyResearch;
+}
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v) => v != null).map(String);
+}
+
+/** Budget columns are INTEGER; the model sometimes returns "50,000" or "50000 KES". */
+function toInteger(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.round(value);
+  if (typeof value === 'string') {
+    const digits = value.replace(/[^0-9.]/g, '');
+    const parsed = Number(digits);
+    if (Number.isFinite(parsed) && digits !== '') return Math.round(parsed);
+  }
+  return undefined;
 }

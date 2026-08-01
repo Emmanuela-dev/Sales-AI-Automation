@@ -1,4 +1,4 @@
-import { openai, DEFAULT_MODEL } from '../../lib/openai';
+import { generateJson } from '../../lib/openai';
 import { supabaseAdmin } from '../../lib/supabase';
 
 interface ScoringInput {
@@ -12,17 +12,27 @@ interface ScoreResult {
 }
 
 /**
+ * Stages that scoring is allowed to advance a lead out of. Once a human has
+ * moved a lead to 'contacted' or beyond, re-scoring must not rewind it — that
+ * would silently undo real sales progress.
+ */
+const AUTO_ADVANCEABLE_STATUSES = ['discovered', 'analyzing'];
+const QUALIFICATION_THRESHOLD = 70;
+
+/**
  * AI Lead Scoring Agent
  * Analyzes all available data on a business and returns an opportunity score 0-100
  */
 export async function scoreLead(input: ScoringInput): Promise<ScoreResult> {
   // Gather all data
-  const [bizResult, analysisResult, researchResult] = await Promise.all([
-    supabaseAdmin.from('businesses').select('*').eq('id', input.business_id).single(),
+  const [leadResult, bizResult, analysisResult, researchResult] = await Promise.all([
+    supabaseAdmin.from('leads').select('id, status').eq('id', input.lead_id).maybeSingle(),
+    supabaseAdmin.from('businesses').select('*').eq('id', input.business_id).maybeSingle(),
     supabaseAdmin.from('website_analyses').select('*').eq('business_id', input.business_id).order('analyzed_at', { ascending: false }).limit(1).maybeSingle(),
     supabaseAdmin.from('company_research').select('*').eq('business_id', input.business_id).order('generated_at', { ascending: false }).limit(1).maybeSingle(),
   ]);
 
+  const lead = leadResult.data;
   const biz = bizResult.data;
   const analysis = analysisResult.data;
   const research = researchResult.data;
@@ -63,29 +73,38 @@ Respond ONLY with JSON:
   ]
 }`;
 
-  const response = await openai.chat.completions.create({
-    model: DEFAULT_MODEL,
-    messages: [{ role: 'user', content: prompt }],
+  const raw = await generateJson<{ score?: unknown; reasons?: unknown }>({
+    prompt,
     temperature: 0.2,
-    response_format: { type: 'json_object' },
+    purpose: 'Lead scoring',
   });
 
-  const raw = JSON.parse(response.choices[0].message.content ?? '{}');
+  const parsedScore = Number(raw.score);
   const result: ScoreResult = {
-    score: Math.min(100, Math.max(0, Number(raw.score) || 50)),
-    reasons: Array.isArray(raw.reasons) ? raw.reasons : [],
+    score: Number.isFinite(parsedScore) ? Math.min(100, Math.max(0, Math.round(parsedScore))) : 50,
+    reasons: Array.isArray(raw.reasons) ? raw.reasons.map(String) : [],
   };
 
-  // Save score back to lead
-  await supabaseAdmin
-    .from('leads')
-    .update({
-      opportunity_score: result.score,
-      score_reasons: result.reasons,
-      status: result.score >= 70 ? 'qualified' : 'discovered',
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', input.lead_id);
+  const updates: Record<string, unknown> = {
+    opportunity_score: result.score,
+    score_reasons: result.reasons,
+    updated_at: new Date().toISOString(),
+  };
+
+  // Only ever move a lead forward, and only out of the early stages.
+  const currentStatus = lead?.status as string | undefined;
+  if (
+    result.score >= QUALIFICATION_THRESHOLD &&
+    currentStatus &&
+    AUTO_ADVANCEABLE_STATUSES.includes(currentStatus)
+  ) {
+    updates.status = 'qualified';
+  }
+
+  const { error } = await supabaseAdmin.from('leads').update(updates).eq('id', input.lead_id);
+  if (error) {
+    throw new Error(`Failed to save lead score: ${error.message}`);
+  }
 
   return result;
 }

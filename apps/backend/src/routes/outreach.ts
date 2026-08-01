@@ -2,21 +2,24 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { supabaseAdmin } from '../lib/supabase';
 import { generateOutreachMessages } from '../services/ai/outreachGenerator';
+import { assertLeadOwned, NotFoundError, requireUserId } from '../lib/auth';
 
 const uuidParam = z.object({ id: z.string().uuid() });
 
 const generateSchema = z.object({
   lead_id: z.string().uuid(),
-  channels: z.array(z.enum(['email', 'whatsapp', 'linkedin', 'cold_call_script'])).min(1),
+  channels: z.array(z.enum(['email', 'whatsapp', 'linkedin', 'cold_call_script'])).min(1).max(4),
   tone: z.enum(['professional', 'casual', 'urgent']).default('professional'),
-  focus: z.string().optional(),
+  focus: z.string().max(500).optional(),
 });
 
-const updateSchema = z.object({
-  status: z.enum(['draft', 'sent', 'opened', 'replied', 'bounced']).optional(),
-  body: z.string().optional(),
-  subject: z.string().optional(),
-});
+const updateSchema = z
+  .object({
+    status: z.enum(['draft', 'sent', 'opened', 'replied', 'bounced']).optional(),
+    body: z.string().min(1).optional(),
+    subject: z.string().optional(),
+  })
+  .refine((body) => Object.keys(body).length > 0, { message: 'No fields to update' });
 
 export async function outreachRoutes(fastify: FastifyInstance) {
   /**
@@ -24,15 +27,18 @@ export async function outreachRoutes(fastify: FastifyInstance) {
    * List all outreach messages for a lead
    */
   fastify.get('/lead/:id', async (request, reply) => {
+    const userId = requireUserId(request);
     const { id } = uuidParam.parse(request.params);
+    await assertLeadOwned(id, userId);
+
     const { data, error } = await supabaseAdmin
       .from('outreach_messages')
       .select('*')
       .eq('lead_id', id)
       .order('generated_at', { ascending: false });
 
-    if (error) return reply.code(500).send({ error: error.message });
-    return reply.send({ messages: data });
+    if (error) throw new Error(`Failed to load outreach messages: ${error.message}`);
+    return reply.send({ messages: data ?? [] });
   });
 
   /**
@@ -40,7 +46,10 @@ export async function outreachRoutes(fastify: FastifyInstance) {
    * AI-generate personalized outreach for a lead
    */
   fastify.post('/generate', async (request, reply) => {
+    const userId = requireUserId(request);
     const params = generateSchema.parse(request.body);
+    await assertLeadOwned(params.lead_id, userId);
+
     const messages = await generateOutreachMessages(params);
     return reply.code(201).send({ messages });
   });
@@ -50,8 +59,19 @@ export async function outreachRoutes(fastify: FastifyInstance) {
    * Update message status or content
    */
   fastify.patch('/:id', async (request, reply) => {
+    const userId = requireUserId(request);
     const { id } = uuidParam.parse(request.params);
     const updates = updateSchema.parse(request.body);
+
+    const { data: message, error: lookupError } = await supabaseAdmin
+      .from('outreach_messages')
+      .select('id, lead_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (lookupError) throw new Error(`Failed to load message: ${lookupError.message}`);
+    if (!message) throw new NotFoundError('Outreach message not found');
+    await assertLeadOwned(message.lead_id, userId);
 
     const patch: Record<string, unknown> = { ...updates };
     if (updates.status === 'sent') patch.sent_at = new Date().toISOString();
@@ -65,7 +85,7 @@ export async function outreachRoutes(fastify: FastifyInstance) {
       .select()
       .single();
 
-    if (error) return reply.code(500).send({ error: error.message });
+    if (error) throw new Error(`Failed to update message: ${error.message}`);
     return reply.send({ message: data });
   });
 }

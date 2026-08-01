@@ -11,8 +11,12 @@
     "dev": "concurrently --names \"backend,frontend\" --prefix-colors \"cyan,magenta\" \"npm run dev --workspace=apps/backend\" \"npm run dev --workspace=apps/frontend\"",
     "dev:backend": "npm run dev --workspace=apps/backend",
     "dev:frontend": "npm run dev --workspace=apps/frontend",
+    "dev:workers": "npm run dev:workers --workspace=apps/backend",
     "build": "npm run build --workspaces --if-present",
-    "lint": "npm run lint --workspaces --if-present"
+    "lint": "npm run lint --workspaces --if-present",
+    "migrate": "npm run migrate --workspace=apps/backend",
+    "doctor": "npm run doctor --workspace=apps/backend",
+    "setup": "npm install && npx playwright install chromium"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

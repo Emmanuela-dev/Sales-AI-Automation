@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { createClient } from '@/lib/supabase/client';
 
 export const api = axios.create({
   baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000/api/v1',
@@ -7,6 +8,40 @@ export const api = axios.create({
     'Content-Type': 'application/json',
   },
 });
+
+/**
+ * The backend authenticates every /api/v1 request with the Supabase access
+ * token. Supabase stores the session in cookies that the browser client can
+ * read, so attach the token here rather than at each call site.
+ */
+api.interceptors.request.use(async (config) => {
+  if (typeof window === 'undefined') return config;
+
+  const {
+    data: { session },
+  } = await createClient().auth.getSession();
+
+  if (session?.access_token) {
+    config.headers.Authorization = `Bearer ${session.access_token}`;
+  }
+
+  return config;
+});
+
+/** A rejected token means the session lapsed — send the user back to sign in. */
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (
+      typeof window !== 'undefined' &&
+      error?.response?.status === 401 &&
+      window.location.pathname !== '/login'
+    ) {
+      window.location.assign('/login');
+    }
+    return Promise.reject(error);
+  }
+);
 
 // ─── Search ──────────────────────────────────────────────────────────────────
 

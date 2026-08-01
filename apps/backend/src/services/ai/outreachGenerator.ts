@@ -1,4 +1,4 @@
-import { openai, DEFAULT_MODEL } from '../../lib/openai';
+import { generateJson, AIError } from '../../lib/openai';
 import { supabaseAdmin } from '../../lib/supabase';
 import type { OutreachMessage, OutreachChannel, GenerateOutreachParams } from '@prospectai/shared';
 
@@ -10,15 +10,17 @@ export async function generateOutreachMessages(
   params: GenerateOutreachParams
 ): Promise<OutreachMessage[]> {
   // Fetch lead + business + research
-  const { data: lead } = await supabaseAdmin
+  const { data: lead, error: leadError } = await supabaseAdmin
     .from('leads')
     .select('*, businesses(*)')
     .eq('id', params.lead_id)
-    .single();
+    .maybeSingle();
 
+  if (leadError) throw new Error(`Failed to load lead: ${leadError.message}`);
   if (!lead) throw new Error('Lead not found');
 
-  const biz = (lead as { businesses: Record<string, unknown> }).businesses;
+  const biz = (lead as { businesses: Record<string, unknown> | null }).businesses;
+  if (!biz) throw new Error('Lead is not linked to a business');
 
   const { data: research } = await supabaseAdmin
     .from('company_research')
@@ -28,29 +30,34 @@ export async function generateOutreachMessages(
     .limit(1)
     .maybeSingle();
 
-  const context = buildContext(biz as Record<string, unknown>, research, params);
+  const context = buildContext(biz, research, params);
 
-  const messages: OutreachMessage[] = [];
-
-  for (const channel of params.channels) {
-    const content = await generateForChannel(channel, context, params.tone ?? 'professional');
-    const msg: OutreachMessage = {
-      id: crypto.randomUUID(),
-      lead_id: params.lead_id,
-      business_id: lead.business_id,
+  // Channels are independent, so generate them concurrently instead of waiting
+  // for each round trip in turn.
+  const generated = await Promise.all(
+    params.channels.map(async (channel) => ({
       channel,
-      subject: content.subject,
-      body: content.body,
-      personalization_context: context,
-      status: 'draft',
-      generated_at: new Date().toISOString(),
-    };
+      content: await generateForChannel(channel, context, params.tone ?? 'professional'),
+    }))
+  );
 
-    await supabaseAdmin.from('outreach_messages').insert(msg);
-    messages.push(msg);
+  const rows = generated.map(({ channel, content }) => ({
+    lead_id: params.lead_id,
+    business_id: lead.business_id,
+    channel,
+    subject: content.subject ?? null,
+    body: content.body,
+    personalization_context: context,
+    status: 'draft' as const,
+  }));
+
+  const { data, error } = await supabaseAdmin.from('outreach_messages').insert(rows).select();
+
+  if (error) {
+    throw new Error(`Failed to save outreach messages: ${error.message}`);
   }
 
-  return messages;
+  return (data as OutreachMessage[]) ?? [];
 }
 
 function buildContext(
@@ -91,12 +98,23 @@ Task: ${instructions[channel]}
 Respond ONLY with JSON:
 ${channel === 'email' ? '{"subject": "...", "body": "..."}' : '{"body": "..."}'}`;
 
-  const response = await openai.chat.completions.create({
-    model: DEFAULT_MODEL,
-    messages: [{ role: 'user', content: prompt }],
+  const raw = await generateJson<{ subject?: unknown; body?: unknown }>({
+    prompt,
     temperature: 0.7,
-    response_format: { type: 'json_object' },
+    purpose: `Outreach generation (${channel})`,
   });
 
-  return JSON.parse(response.choices[0].message.content ?? '{"body": ""}');
+  const body = typeof raw.body === 'string' ? raw.body.trim() : '';
+
+  // outreach_messages.body is NOT NULL — inserting an empty body would fail at
+  // the database with an opaque constraint error, so reject it here instead.
+  if (!body) {
+    throw new AIError(
+      `Outreach generation (${channel}) returned no message body. Try again, or adjust the focus.`
+    );
+  }
+
+  const subject = typeof raw.subject === 'string' && raw.subject.trim() ? raw.subject.trim() : undefined;
+
+  return channel === 'email' ? { subject, body } : { body };
 }
